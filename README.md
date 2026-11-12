@@ -1,4 +1,69 @@
-# 配送数仓列依赖分析服务
+# 配送数仓服务：列依赖分析 + 运单扫描按日合并
+
+服务包含两部分能力：
+
+1. **列依赖分析 `POST /analyze`**：接收源表定义、各模型的 DuckDB SELECT 与待下线
+   源列，**只用 SQLGlot 解析、不执行任何 SQL**，沿别名、普通星号与非递归 CTE
+   跨模型追踪列引用（规则见下文）。
+2. **运单扫描按日合并 `/batches`、`/merges`、`/manifest`**：站点把每批运单扫描
+   落成一份 Parquet 小文件并追加到当日清单；值班员按 UTC 日把合并开始时清单里的
+   文件并成一份，一次替换清单条目，供下游按日取数。
+
+---
+
+# 一、运单扫描按日合并
+
+## 数据模型
+
+每条扫描记录三列，所有 Parquet 文件 schema 一致：
+
+| 列 | 类型 | 含义 |
+| --- | --- | --- |
+| `waybill_id` | string | 运单号 |
+| `station` | string | 站点标识 |
+| `scanned_at` | int64 | 扫描时刻，UTC 秒（Unix epoch seconds） |
+
+站点每批上报若干记录，**同批只允许含一个 UTC 日**，服务把整批写成一份 Parquet
+（`scans/<UTC日>/<uuid>.parquet`），并在清单 `manifest.json` 中追加一个条目。
+
+## 接口
+
+### `POST /batches` — 接收一批扫描
+
+请求体见 `examples/batch_beijing.json`、`examples/batch_shanghai.json`，Swagger
+内置了同 UTC 日（2026-11-11）的两批样例，可直接 Try it out。可选字段 `day`
+（`YYYY-MM-DD`）给出时会与记录扫描时刻所属的 UTC 日核对，不一致返回 400。
+
+### `POST /merges` — 按日合并
+
+请求体 `{"day": "2026-11-11"}`。合并语义：
+
+- **快照语义**：只合并"合并开始时"清单里该日的文件，合并期间照常接收的新批不参与
+  本轮，新条目在清单中原样保留（响应里的 `kept_new_count`）。
+- **保留全部行，包括重复行**：直接拼接 Parquet，不去重、不改写列。
+- **一次替换**：新合并文件（`merged/<UTC日>/<uuid>.parquet`）写完后，在清单中
+  一次性把本轮输入条目换成合并条目；中途入库的新批条目保留。
+- **旧文件不删除**：拿到旧清单的下游作业仍可从共享数据卷继续读小文件。
+- **失败不改清单**：任一输入 Parquet 读失败、合并文件写失败（HTTP 500），或本轮
+  输入已被另一轮合并换下（HTTP 409），本轮报错且清单保持不变，已写出的半成品
+  合并文件会被清理。该日无文件时返回 404。
+
+### `GET /manifest?day=YYYY-MM-DD` — 下游按日取清单
+
+返回该日当前清单的全部条目（`path` 为相对共享数据卷根目录的 Parquet 路径）、
+文件数与总行数；不带 `day` 则返回所有日期的条目（按日期排序）。
+
+## 并发、持久化与重启
+
+- 清单通过同目录侧车锁文件上的 `fcntl.flock` 保护，多个 uvicorn worker/进程安全；
+  每次更新都在锁内重读清单并比对合并开始时的快照 id，以发现并发合并。
+- 清单与 Parquet 都先写临时文件再 `os.replace` 原子替换，并对目录 `fsync`。
+- 所有状态都在共享数据卷（环境变量 `SCAN_DATA_DIR`，容器内 `/data`），**服务重启
+  后直接读取当前清单继续服务**。
+
+---
+
+# 二、列依赖分析（POST /analyze）
 
 运单源表即将停供旧邮编列。本服务接收源表定义、各模型的 DuckDB SELECT 与待下线源列，
 **只用 SQLGlot 解析、不执行任何 SQL**，沿别名、普通星号与非递归 CTE 跨模型追踪列引用，
@@ -40,9 +105,31 @@ docker compose up --build
 # OpenAPI: http://localhost:8000/openapi.json
 ```
 
-Swagger 的 `POST /analyze` 请求体自带"邮编改名后仍用于筛选"的样例，可直接 Try it out。
+Compose 把命名卷 `scan-data` 挂到容器 `/data`（`SCAN_DATA_DIR`），Parquet 与
+`manifest.json` 都落在该卷；下游作业可挂载同一卷按清单路径取数，容器重建不丢数据。
 
-## 请求示例
+### Swagger 走一遍合并流程
+
+1. 打开 http://localhost:8000/docs，在 `POST /batches` 用内置样例提交**两批**
+   （北京批 3 行、上海批 2 行，同属 UTC 日 2026-11-11，运单 WB1002 两批重复）。
+2. `POST /merges` 提交 `{"day": "2026-11-11"}`，返回 `replaced_count=2`、
+   `row_count=5`。
+3. `GET /manifest?day=2026-11-11` 查看清单：只剩一个 `kind=merged` 条目，
+   `source_ids` 记录被换下的两个小文件 id。
+
+也可用 curl：
+
+```bash
+curl -X POST http://localhost:8000/batches -H 'Content-Type: application/json' \
+  --data @examples/batch_beijing.json
+curl -X POST http://localhost:8000/batches -H 'Content-Type: application/json' \
+  --data @examples/batch_shanghai.json
+curl -X POST http://localhost:8000/merges -H 'Content-Type: application/json' \
+  -d '{"day": "2026-11-11"}'
+curl 'http://localhost:8000/manifest?day=2026-11-11'
+```
+
+## 列依赖分析请求示例
 
 `examples/request_zip_rename.json` 是完整样例（也可用 Swagger 内置样例）：
 
@@ -105,17 +192,19 @@ curl -X POST http://localhost:8000/analyze \
 ```bash
 python -m venv --without-pip .venv   # 若系统带 ensurepip 可直接 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
-PYTHONPATH=. .venv/bin/uvicorn app.main:app --reload
-.venv/bin/pytest                       # 37 个测试
+SCAN_DATA_DIR=./data PYTHONPATH=. .venv/bin/uvicorn app.main:app --reload
+.venv/bin/pytest                       # 55 个测试
 ```
 
 ## 目录
 
 ```
 app/
-  main.py        FastAPI 路由、请求/响应模型、Swagger 样例与入参校验
+  main.py        FastAPI 应用、生命周期、/analyze 路由与请求模型
   lineage.py     SQLGlot 解析与列级血缘分析（不执行 SQL）
-  tests/         分析器与 API 测试
-examples/        邮编改名场景的完整请求样例
+  scan_api.py    /batches、/merges、/manifest 路由、请求/响应模型与 Swagger 样例
+  storage.py     Parquet 读写、清单持久化、flock 并发控制与按日合并
+  tests/         分析器、存储层与 API 测试
+examples/        邮编改名请求样例与两批扫描入库样例
 Dockerfile, docker-compose.yml, requirements.txt
 ```

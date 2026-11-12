@@ -1,0 +1,8 @@
+{
+  "day": "2026-11-11",
+  "records": [
+    {"waybill_id": "WB1001", "station": "BJ-01", "scanned_at": 1794355200},
+    {"waybill_id": "WB1002", "station": "BJ-01", "scanned_at": 1794358800},
+    {"waybill_id": "WB1003", "station": "BJ-02", "scanned_at": 1794362400}
+  ]
+}

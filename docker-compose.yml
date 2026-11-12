@@ -1,13 +1,22 @@
 services:
-  lineage-api:
+  delivery-api:
     build: .
-    image: delivery-lineage-api:latest
-    container_name: delivery-lineage-api
+    image: delivery-api:latest
+    container_name: delivery-api
     ports:
       - "8000:8000"
+    environment:
+      SCAN_DATA_DIR: /data
+    volumes:
+      # 共享数据卷：Parquet 小文件、合并文件与持久化清单都在其中，
+      # 下游作业和重启后的服务都按清单里的相对路径从这里取数。
+      - scan-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"]
       interval: 10s
       timeout: 3s
       retries: 5
+
+volumes:
+  scan-data:
